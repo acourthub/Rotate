@@ -1,0 +1,630 @@
+// Complete Automation System for Pump.fun Fee Claiming & Buybacks
+
+const express = require('express');
+const { Connection, PublicKey, Transaction, Keypair, SystemProgram } = require('@solana/web3.js');
+const { TOKEN_PROGRAM_ID } = require('@solana/spl-token');
+const bs58 = require('bs58');
+const axios = require('axios');
+const cron = require('node-cron');
+const WebSocket = require('ws');
+const fs = require('fs');
+
+// Configuration
+const CONFIG = {
+    SOLANA_RPC_URL: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+    PUMP_FUN_PROGRAM_ID: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun program ID
+    PUMP_FUN_API_BASE: 'https://frontend-api.pump.fun',
+    AUTOMATION_INTERVAL: '*/10 * * * *', // Every 10 minutes
+    MIN_FEE_THRESHOLD: 0.001, // Minimum SOL to claim
+    SLIPPAGE_TOLERANCE: 0.05, // 5% slippage
+    MAX_RETRIES: 3,
+    STREAMFLOW_API_KEY: process.env.STREAMFLOW_API_KEY
+};
+
+const app = express();
+app.use(express.json());
+
+const connection = new Connection(CONFIG.SOLANA_RPC_URL, 'confirmed');
+const wss = new WebSocket.Server({ port: 8080 });
+
+// State management
+let automationState = {
+    isRunning: false,
+    connectedWallets: new Map(),
+    automationRules: new Map(),
+    transactionHistory: [],
+    stats: {
+        totalFeesClaimed: 0,
+        totalBuybacks: 0,
+        totalTransactions: 0,
+        successRate: 0
+    }
+};
+
+// Automation Rule Class
+class AutomationRule {
+    constructor(config) {
+        this.walletAddress = config.walletAddress;
+        this.tokenAddress = config.tokenAddress;
+        this.privateKey = config.privateKey; // Store securely encrypted
+        this.isActive = config.isActive || true;
+        this.minClaimAmount = config.minClaimAmount || CONFIG.MIN_FEE_THRESHOLD;
+        this.buybackPercentage = config.buybackPercentage || 100; // % of fees to use for buyback
+        this.maxBuybackAmount = config.maxBuybackAmount || null;
+        this.lastExecuted = null;
+        this.totalClaimed = 0;
+        this.totalBuybacks = 0;
+        this.errorCount = 0;
+    }
+
+    getKeypair() {
+        return Keypair.fromSecretKey(bs58.decode(this.privateKey));
+    }
+}
+
+// Main Automation Engine
+class PumpFunAutomation {
+    constructor() {
+        this.isProcessing = false;
+        this.processingQueue = [];
+    }
+
+    // Start the automation system
+    async start() {
+        console.log('🚀 Starting Pump.fun Automation System...');
+        
+        automationState.isRunning = true;
+        
+        // Schedule automated runs
+        cron.schedule(CONFIG.AUTOMATION_INTERVAL, () => {
+            this.executeAutomationCycle();
+        });
+
+        // Start immediate check
+        setTimeout(() => this.executeAutomationCycle(), 5000);
+        
+        this.broadcastUpdate({
+            type: 'automation_started',
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    // Main automation cycle
+    async executeAutomationCycle() {
+        if (this.isProcessing) {
+            console.log('⏳ Automation cycle already in progress, skipping...');
+            return;
+        }
+
+        this.isProcessing = true;
+        console.log('🔄 Starting automation cycle...');
+
+        try {
+            const activeRules = Array.from(automationState.automationRules.values())
+                .filter(rule => rule.isActive);
+
+            console.log(`📊 Processing ${activeRules.length} active automation rules`);
+
+            for (const rule of activeRules) {
+                try {
+                    await this.processAutomationRule(rule);
+                    await this.sleep(2000); // 2 second delay between rules
+                } catch (error) {
+                    console.error(`❌ Error processing rule for ${rule.walletAddress}:`, error);
+                    rule.errorCount++;
+                }
+            }
+
+            this.broadcastUpdate({
+                type: 'automation_cycle_complete',
+                timestamp: new Date().toISOString(),
+                processedRules: activeRules.length
+            });
+
+        } catch (error) {
+            console.error('❌ Automation cycle error:', error);
+        } finally {
+            this.isProcessing = false;
+        }
+    }
+
+    // Process individual automation rule
+    async processAutomationRule(rule) {
+        console.log(`🔍 Checking fees for ${rule.walletAddress.slice(0, 8)}...`);
+
+        // Step 1: Check available creator fees
+        const availableFees = await this.checkCreatorFees(rule.walletAddress, rule.tokenAddress);
+        
+        if (availableFees < rule.minClaimAmount) {
+            console.log(`💰 Insufficient fees (${availableFees} SOL) for ${rule.walletAddress.slice(0, 8)}`);
+            return;
+        }
+
+        console.log(`💰 Found ${availableFees} SOL in fees for ${rule.walletAddress.slice(0, 8)}`);
+
+        // Step 2: Claim creator fees
+        const claimResult = await this.claimCreatorFees(rule, availableFees);
+        
+        if (!claimResult.success) {
+            throw new Error(`Fee claim failed: ${claimResult.error}`);
+        }
+
+        console.log(`✅ Claimed ${availableFees} SOL - TX: ${claimResult.signature}`);
+
+        // Step 3: Calculate buyback amount
+        const buybackAmount = (availableFees * rule.buybackPercentage) / 100;
+        const finalBuybackAmount = rule.maxBuybackAmount 
+            ? Math.min(buybackAmount, rule.maxBuybackAmount) 
+            : buybackAmount;
+
+        if (finalBuybackAmount < 0.001) {
+            console.log(`💸 Buyback amount too small (${finalBuybackAmount} SOL), skipping buyback`);
+            return;
+        }
+
+        // Step 4: Execute buyback
+        const buybackResult = await this.executeBuyback(rule, finalBuybackAmount);
+
+        if (!buybackResult.success) {
+            throw new Error(`Buyback failed: ${buybackResult.error}`);
+        }
+
+        console.log(`🔄 Buyback complete - TX: ${buybackResult.signature}`);
+
+        // Step 5: Create Streamflow proof
+        const streamflowProof = await this.createStreamflowProof(buybackResult.signature, finalBuybackAmount);
+
+        // Update rule stats
+        rule.totalClaimed += availableFees;
+        rule.totalBuybacks += finalBuybackAmount;
+        rule.lastExecuted = new Date().toISOString();
+
+        // Update global stats
+        automationState.stats.totalFeesClaimed += availableFees;
+        automationState.stats.totalBuybacks += finalBuybackAmount;
+        automationState.stats.totalTransactions += 2; // Claim + buyback
+
+        // Record transactions
+        const transactions = [
+            {
+                type: 'fee_claim',
+                walletAddress: rule.walletAddress,
+                tokenAddress: rule.tokenAddress,
+                amount: availableFees,
+                signature: claimResult.signature,
+                timestamp: new Date().toISOString(),
+                automated: true
+            },
+            {
+                type: 'buyback',
+                walletAddress: rule.walletAddress,
+                tokenAddress: rule.tokenAddress,
+                amount: finalBuybackAmount,
+                signature: buybackResult.signature,
+                timestamp: new Date().toISOString(),
+                streamflowProof: streamflowProof,
+                automated: true
+            }
+        ];
+
+        automationState.transactionHistory.push(...transactions);
+
+        // Broadcast updates
+        transactions.forEach(tx => {
+            this.broadcastUpdate({
+                type: 'transaction_completed',
+                transaction: tx
+            });
+        });
+
+        this.broadcastUpdate({
+            type: 'automation_success',
+            rule: {
+                walletAddress: rule.walletAddress,
+                tokenAddress: rule.tokenAddress,
+                feesClaimed: availableFees,
+                buybackAmount: finalBuybackAmount
+            }
+        });
+    }
+
+    // Check creator fees for a token
+    async checkCreatorFees(walletAddress, tokenAddress) {
+        try {
+            const response = await axios.get(
+                `${CONFIG.PUMP_FUN_API_BASE}/creator-fees/${tokenAddress}/${walletAddress}`,
+                { timeout: 10000 }
+            );
+
+            if (response.data && response.data.available_fees) {
+                return response.data.available_fees / 1e9; // Convert lamports to SOL
+            }
+
+            return 0;
+        } catch (error) {
+            console.error('Error checking creator fees:', error.message);
+            return 0;
+        }
+    }
+
+    // Claim creator fees
+    async claimCreatorFees(rule, amount) {
+        try {
+            const keypair = rule.getKeypair();
+            
+            // Build claim transaction
+            const transaction = new Transaction();
+            
+            // Add claim instruction (this is pump.fun specific)
+            const claimInstruction = await this.buildClaimInstruction(
+                keypair.publicKey,
+                new PublicKey(rule.tokenAddress),
+                amount
+            );
+            
+            transaction.add(claimInstruction);
+
+            // Get recent blockhash and set fee payer
+            const { blockhash } = await connection.getLatestBlockhash();
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = keypair.publicKey;
+
+            // Sign and send transaction
+            transaction.sign(keypair);
+            const signature = await connection.sendRawTransaction(transaction.serialize());
+
+            // Wait for confirmation with timeout
+            const confirmation = await Promise.race([
+                connection.confirmTransaction(signature),
+                new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Transaction timeout')), 60000)
+                )
+            ]);
+
+            if (confirmation.value.err) {
+                throw new Error(`Transaction failed: ${confirmation.value.err}`);
+            }
+
+            return { success: true, signature };
+
+        } catch (error) {
+            console.error('Claim fees error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    // Execute token buyback
+    async executeBuyback(rule, solAmount) {
+        try {
+            const keypair = rule.getKeypair();
+            
+            // Get current token price and calculate amount
+            const tokenPrice = await this.getTokenPrice(rule.tokenAddress);
+            const tokenAmount = (solAmount / tokenPrice) * (1 - CONFIG.SLIPPAGE_TOLERANCE);
+
+            // Build buy transaction
+            const transaction = new Transaction();
+            
+            const buyInstruction = await this.buildBuyInstruction(
+                keypair.publicKey,
+                new PublicKey(rule.tokenAddress),
+                solAmount,
+                tokenAmount
+            );
+            
+            transaction.add(buyInstruction);
+
+            // Get recent blockhash and set fee payer
+            const { blockhash } = await connection.getLatestBlockhash();
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = keypair.publicKey;
+
+            // Sign and send transaction
+            transaction.sign(keypair);
+            const signature = await connection.sendRawTransaction(transaction.serialize());
+
+            // Wait for confirmation
+            const confirmation = await Promise.race([
+                connection.confirmTransaction(signature),
+                new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Transaction timeout')), 60000)
+                )
+            ]);
+
+            if (confirmation.value.err) {
+                throw new Error(`Buyback transaction failed: ${confirmation.value.err}`);
+            }
+
+            return { success: true, signature, tokenAmount };
+
+        } catch (error) {
+            console.error('Buyback error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    // Build pump.fun claim instruction
+    async buildClaimInstruction(walletPubkey, tokenPubkey, amount) {
+        // This is a simplified example - you'll need the actual pump.fun instruction format
+        const instruction = {
+            programId: new PublicKey(CONFIG.PUMP_FUN_PROGRAM_ID),
+            keys: [
+                { pubkey: walletPubkey, isSigner: true, isWritable: true },
+                { pubkey: tokenPubkey, isSigner: false, isWritable: true },
+                // Add other required accounts based on pump.fun's contract
+            ],
+            data: Buffer.from([
+                // Instruction discriminator for claim_fees
+                1, // This would be the actual instruction code
+                ...new BN(amount * 1e9).toArray('le', 8) // Amount in lamports
+            ])
+        };
+
+        return instruction;
+    }
+
+    // Build pump.fun buy instruction
+    async buildBuyInstruction(walletPubkey, tokenPubkey, solAmount, tokenAmount) {
+        // This is a simplified example - you'll need the actual pump.fun instruction format
+        const instruction = {
+            programId: new PublicKey(CONFIG.PUMP_FUN_PROGRAM_ID),
+            keys: [
+                { pubkey: walletPubkey, isSigner: true, isWritable: true },
+                { pubkey: tokenPubkey, isSigner: false, isWritable: true },
+                // Add other required accounts for buying
+            ],
+            data: Buffer.from([
+                // Instruction discriminator for buy
+                2, // This would be the actual instruction code
+                ...new BN(solAmount * 1e9).toArray('le', 8), // SOL amount in lamports
+                ...new BN(tokenAmount * 1e6).toArray('le', 8) // Token amount with decimals
+            ])
+        };
+
+        return instruction;
+    }
+
+    // Get current token price
+    async getTokenPrice(tokenAddress) {
+        try {
+            const response = await axios.get(
+                `${CONFIG.PUMP_FUN_API_BASE}/coins/${tokenAddress}`,
+                { timeout: 5000 }
+            );
+
+            if (response.data && response.data.price_sol) {
+                return parseFloat(response.data.price_sol);
+            }
+
+            throw new Error('Price data not available');
+        } catch (error) {
+            console.error('Error getting token price:', error);
+            // Fallback price calculation or throw error
+            throw new Error('Unable to get token price');
+        }
+    }
+
+    // Create Streamflow payment proof
+    async createStreamflowProof(signature, amount) {
+        try {
+            if (!CONFIG.STREAMFLOW_API_KEY) {
+                return {
+                    streamflowId: `sf_${signature}`,
+                    proofUrl: `https://streamflow.finance/proof/${signature}`,
+                    verified: false,
+                    note: 'API key not configured'
+                };
+            }
+
+            const response = await axios.post('https://api.streamflow.finance/create-proof', {
+                transactionSignature: signature,
+                amount: amount,
+                currency: 'SOL',
+                description: 'Pump.fun Token Buyback'
+            }, {
+                headers: {
+                    'Authorization': `Bearer ${CONFIG.STREAMFLOW_API_KEY}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            return {
+                streamflowId: response.data.id,
+                proofUrl: response.data.proof_url,
+                verified: true
+            };
+
+        } catch (error) {
+            console.error('Streamflow proof creation error:', error);
+            return {
+                streamflowId: `sf_${signature}`,
+                proofUrl: `https://streamflow.finance/proof/${signature}`,
+                verified: false,
+                error: error.message
+            };
+        }
+    }
+
+    // Utility function for delays
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // Broadcast updates to connected clients
+    broadcastUpdate(data) {
+        wss.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                try {
+                    client.send(JSON.stringify({
+                        ...data,
+                        timestamp: data.timestamp || new Date().toISOString()
+                    }));
+                } catch (error) {
+                    console.error('WebSocket broadcast error:', error);
+                }
+            }
+        });
+    }
+}
+
+// Initialize automation engine
+const automationEngine = new PumpFunAutomation();
+
+// API Endpoints
+
+// Add automation rule
+app.post('/api/automation/add-rule', async (req, res) => {
+    try {
+        const { walletAddress, tokenAddress, privateKey, config } = req.body;
+
+        // Validate inputs
+        if (!walletAddress || !tokenAddress || !privateKey) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        // Verify wallet and token
+        const keypair = Keypair.fromSecretKey(bs58.decode(privateKey));
+        if (keypair.publicKey.toString() !== walletAddress) {
+            return res.status(400).json({ error: 'Private key does not match wallet address' });
+        }
+
+        // Create automation rule
+        const rule = new AutomationRule({
+            walletAddress,
+            tokenAddress,
+            privateKey, // In production, encrypt this!
+            ...config
+        });
+
+        automationState.automationRules.set(walletAddress, rule);
+
+        res.json({
+            success: true,
+            message: 'Automation rule added successfully',
+            ruleId: walletAddress
+        });
+
+    } catch (error) {
+        console.error('Add rule error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Remove automation rule
+app.delete('/api/automation/remove-rule/:walletAddress', (req, res) => {
+    const { walletAddress } = req.params;
+    
+    if (automationState.automationRules.has(walletAddress)) {
+        automationState.automationRules.delete(walletAddress);
+        res.json({ success: true, message: 'Automation rule removed' });
+    } else {
+        res.status(404).json({ error: 'Automation rule not found' });
+    }
+});
+
+// Toggle automation rule
+app.post('/api/automation/toggle-rule/:walletAddress', (req, res) => {
+    const { walletAddress } = req.params;
+    const rule = automationState.automationRules.get(walletAddress);
+    
+    if (!rule) {
+        return res.status(404).json({ error: 'Automation rule not found' });
+    }
+    
+    rule.isActive = !rule.isActive;
+    
+    res.json({
+        success: true,
+        message: `Automation rule ${rule.isActive ? 'enabled' : 'disabled'}`,
+        isActive: rule.isActive
+    });
+});
+
+// Get automation status
+app.get('/api/automation/status', (req, res) => {
+    const rules = Array.from(automationState.automationRules.values()).map(rule => ({
+        walletAddress: rule.walletAddress,
+        tokenAddress: rule.tokenAddress,
+        isActive: rule.isActive,
+        totalClaimed: rule.totalClaimed,
+        totalBuybacks: rule.totalBuybacks,
+        lastExecuted: rule.lastExecuted,
+        errorCount: rule.errorCount
+    }));
+
+    res.json({
+        isRunning: automationState.isRunning,
+        activeRules: rules.filter(r => r.isActive).length,
+        totalRules: rules.length,
+        stats: automationState.stats,
+        rules: rules
+    });
+});
+
+// Manual trigger automation cycle
+app.post('/api/automation/trigger', async (req, res) => {
+    try {
+        // Run automation cycle in background
+        automationEngine.executeAutomationCycle().catch(console.error);
+        
+        res.json({
+            success: true,
+            message: 'Automation cycle triggered'
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get transaction history
+app.get('/api/transactions', (req, res) => {
+    const { limit = 50, type, walletAddress } = req.query;
+    
+    let filtered = automationState.transactionHistory;
+    
+    if (type) {
+        filtered = filtered.filter(tx => tx.type === type);
+    }
+    
+    if (walletAddress) {
+        filtered = filtered.filter(tx => tx.walletAddress === walletAddress);
+    }
+    
+    // Sort by timestamp (newest first) and limit
+    const transactions = filtered
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+        .slice(0, parseInt(limit));
+    
+    res.json({
+        transactions,
+        total: filtered.length,
+        stats: automationState.stats
+    });
+});
+
+// Start server and automation
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    
+    // Start automation system
+    await automationEngine.start();
+    
+    console.log('✅ Pump.fun Automation System is now running');
+    console.log(`⏰ Automation runs every 10 minutes`);
+    console.log(`💰 Minimum claim threshold: ${CONFIG.MIN_FEE_THRESHOLD} SOL`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('🛑 Shutting down automation system...');
+    automationState.isRunning = false;
+    process.exit(0);
+});
+
+// Export for testing
+module.exports = {
+    automationEngine,
+    AutomationRule,
+    PumpFunAutomation
+};
