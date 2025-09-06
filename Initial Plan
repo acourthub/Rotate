@@ -1,0 +1,426 @@
+// Backend API (Node.js/Express example)
+const express = require('express');
+const { Connection, PublicKey, Transaction } = require('@solana/web3.js');
+const cron = require('node-cron');
+const WebSocket = require('ws');
+
+const app = express();
+const connection = new Connection('https://api.mainnet-beta.solana.com');
+
+// In-memory storage for demo (use proper database in production)
+let transactionHistory = [];
+let feesClaimed = 0;
+let totalBuybacks = 0;
+
+// WebSocket for real-time updates
+const wss = new WebSocket.Server({ port: 8080 });
+
+function broadcastUpdate(data) {
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(data));
+        }
+    });
+}
+
+// Function to claim creator fees from pump.fun
+async function claimCreatorFees() {
+    try {
+        console.log('Checking for available creator fees...');
+        
+        // This would interact with pump.fun's smart contract
+        // Replace with actual pump.fun contract interaction
+        const feesAvailable = await checkPumpFunFees();
+        
+        if (feesAvailable > 0) {
+            const claimTx = await createClaimTransaction(feesAvailable);
+            const signature = await submitTransaction(claimTx);
+            
+            feesClaimed += feesAvailable;
+            
+            const claimRecord = {
+                type: 'fee_claim',
+                amount: feesAvailable,
+                signature: signature,
+                timestamp: new Date().toISOString()
+            };
+            
+            transactionHistory.push(claimRecord);
+            broadcastUpdate(claimRecord);
+            
+            console.log(`Claimed ${feesAvailable} SOL in creator fees`);
+            return feesAvailable;
+        }
+        
+        return 0;
+    } catch (error) {
+        console.error('Error claiming fees:', error);
+        return 0;
+    }
+}
+
+// Function to execute buyback with claimed fees
+async function executeBuyback(amount) {
+    try {
+        if (amount <= 0) return null;
+        
+        console.log(`Executing buyback with ${amount} SOL...`);
+        
+        // Create buyback transaction on pump.fun
+        const buybackTx = await createBuybackTransaction(amount);
+        const signature = await submitTransaction(buybackTx);
+        
+        totalBuybacks += amount;
+        
+        const buybackRecord = {
+            type: 'buyback',
+            amount: amount,
+            signature: signature,
+            timestamp: new Date().toISOString(),
+            streamflowProof: await createStreamflowProof(signature)
+        };
+        
+        transactionHistory.push(buybackRecord);
+        broadcastUpdate(buybackRecord);
+        
+        console.log(`Buyback completed: ${signature}`);
+        return buybackRecord;
+    } catch (error) {
+        console.error('Error executing buyback:', error);
+        return null;
+    }
+}
+
+// Placeholder functions for pump.fun integration
+async function checkPumpFunFees() {
+    // Simulate checking fees - replace with actual pump.fun API calls
+    return Math.random() * 0.1; // Random amount between 0-0.1 SOL
+}
+
+async function createClaimTransaction(amount) {
+    // Create actual claim transaction for pump.fun
+    // This would involve interacting with pump.fun's smart contract
+    return new Transaction();
+}
+
+async function createBuybackTransaction(amount) {
+    // Create buyback transaction on pump.fun
+    // This would involve calling pump.fun's buy function
+    return new Transaction();
+}
+
+async function submitTransaction(transaction) {
+    // Submit transaction to Solana network
+    // Return transaction signature
+    return 'mock_signature_' + Date.now();
+}
+
+async function createStreamflowProof(signature) {
+    // Create streamflow proof of payment
+    // This would involve Streamflow's API
+    return {
+        streamflowId: 'sf_' + signature,
+        proofUrl: `https://streamflow.finance/proof/${signature}`,
+        verified: true
+    };
+}
+
+// Scheduled task - runs every 10 minutes
+cron.schedule('*/10 * * * *', async () => {
+    console.log('Running automated fee claim and buyback...');
+    
+    const claimedAmount = await claimCreatorFees();
+    
+    if (claimedAmount > 0) {
+        await executeBuyback(claimedAmount);
+    }
+});
+
+// API endpoints
+app.use(express.json());
+app.use(express.static('public'));
+
+app.get('/api/stats', (req, res) => {
+    res.json({
+        feesClaimed,
+        totalBuybacks,
+        transactionCount: transactionHistory.length,
+        lastUpdate: new Date().toISOString()
+    });
+});
+
+app.get('/api/transactions', (req, res) => {
+    res.json({
+        transactions: transactionHistory.slice(-50), // Last 50 transactions
+        total: transactionHistory.length
+    });
+});
+
+app.get('/api/latest', (req, res) => {
+    const latest = transactionHistory[transactionHistory.length - 1];
+    res.json(latest || null);
+});
+
+// Manual trigger endpoint (for testing)
+app.post('/api/trigger-buyback', async (req, res) => {
+    try {
+        const claimedAmount = await claimCreatorFees();
+        const buybackResult = await executeBuyback(claimedAmount);
+        
+        res.json({
+            success: true,
+            claimedAmount,
+            buybackResult
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log('Automated buyback system started');
+    console.log('WebSocket server running on port 8080');
+});
+
+// Frontend HTML (save as public/index.html)
+const frontendHTML = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pump.fun Auto-Buyback System</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 0;
+            padding: 20px;
+            color: white;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        .stat-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .transactions {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 20px;
+        }
+        .transaction {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        .transaction.fee_claim {
+            border-left: 4px solid #4CAF50;
+        }
+        .transaction.buyback {
+            border-left: 4px solid #2196F3;
+        }
+        .status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+        .status.live {
+            background: #4CAF50;
+        }
+        .proof-link {
+            color: #64B5F6;
+            text-decoration: none;
+        }
+        .proof-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Pump.fun Auto-Buyback System</h1>
+            <div class="status live">● LIVE</div>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" id="fees-claimed">0 SOL</div>
+                <div>Total Fees Claimed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="total-buybacks">0 SOL</div>
+                <div>Total Buybacks</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="transaction-count">0</div>
+                <div>Total Transactions</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="next-run">--:--</div>
+                <div>Next Auto-Run</div>
+            </div>
+        </div>
+        
+        <div class="transactions">
+            <h2>Recent Transactions</h2>
+            <div id="transactions-list">
+                <p>Waiting for transactions...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket connection for real-time updates
+        const ws = new WebSocket('ws://localhost:8080');
+        
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            addTransaction(data);
+            updateStats();
+        };
+        
+        // Load initial data
+        async function loadStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const stats = await response.json();
+                
+                document.getElementById('fees-claimed').textContent = stats.feesClaimed.toFixed(4) + ' SOL';
+                document.getElementById('total-buybacks').textContent = stats.totalBuybacks.toFixed(4) + ' SOL';
+                document.getElementById('transaction-count').textContent = stats.transactionCount;
+            } catch (error) {
+                console.error('Error loading stats:', error);
+            }
+        }
+        
+        async function loadTransactions() {
+            try {
+                const response = await fetch('/api/transactions');
+                const data = await response.json();
+                
+                const container = document.getElementById('transactions-list');
+                container.innerHTML = '';
+                
+                if (data.transactions.length === 0) {
+                    container.innerHTML = '<p>No transactions yet...</p>';
+                    return;
+                }
+                
+                data.transactions.reverse().forEach(tx => {
+                    addTransaction(tx, false);
+                });
+            } catch (error) {
+                console.error('Error loading transactions:', error);
+            }
+        }
+        
+        function addTransaction(tx, prepend = true) {
+            const container = document.getElementById('transactions-list');
+            
+            if (container.querySelector('p')) {
+                container.innerHTML = '';
+            }
+            
+            const txElement = document.createElement('div');
+            txElement.className = 'transaction ' + tx.type;
+            
+            const typeLabel = tx.type === 'fee_claim' ? 'Fee Claim' : 'Buyback';
+            const streamflowSection = tx.streamflowProof ? 
+                '<p><strong>Streamflow Proof:</strong> <a href="' + tx.streamflowProof.proofUrl + '" class="proof-link" target="_blank">View Proof ✓</a></p>' : '';
+            
+            txElement.innerHTML = '
+                <h3>' + typeLabel + ' - ' + tx.amount.toFixed(4) + ' SOL</h3>
+                <p><strong>Signature:</strong> <code>' + tx.signature + '</code></p>
+                <p><strong>Time:</strong> ' + new Date(tx.timestamp).toLocaleString() + '</p>
+                ' + streamflowSection + '
+            ';
+            
+            if (prepend) {
+                container.insertBefore(txElement, container.firstChild);
+            } else {
+                container.appendChild(txElement);
+            }
+        }
+        
+        async function updateStats() {
+            await loadStats();
+        }
+        
+        // Update countdown timer
+        function updateCountdown() {
+            const now = new Date();
+            const minutes = now.getMinutes();
+            const seconds = now.getSeconds();
+            
+            // Next 10-minute interval
+            const nextRun = 10 - (minutes % 10);
+            const nextRunSeconds = 60 - seconds;
+            
+            const display = (nextRun === 10 ? 0 : nextRun) + ':' + 
+                           (nextRunSeconds === 60 ? '00' : nextRunSeconds.toString().padStart(2, '0'));
+            
+            document.getElementById('next-run').textContent = display;
+        }
+        
+        // Initialize
+        loadStats();
+        loadTransactions();
+        updateCountdown();
+        
+        // Update countdown every second
+        setInterval(updateCountdown, 1000);
+        
+        // Refresh stats every 30 seconds
+        setInterval(updateStats, 30000);
+    </script>
+</body>
+</html>
+`;
+
+// Package.json for dependencies
+const packageJson = {
+    "name": "pumpfun-auto-buyback",
+    "version": "1.0.0",
+    "main": "server.js",
+    "dependencies": {
+        "express": "^4.18.2",
+        "@solana/web3.js": "^1.87.6",
+        "node-cron": "^3.0.3",
+        "ws": "^8.14.2"
+    },
+    "scripts": {
+        "start": "node server.js",
+        "dev": "nodemon server.js"
+    }
+};
